@@ -54,7 +54,7 @@ struct ConfigForward {
     private_discussion: Option<String>,
     forwarded_from_channel: Option<String>,
     forwarded_from_user: Option<String>,
-    posted_by: String,
+    posted_by: Option<String>,
 }
 
 async fn create_client(config: &Config) -> Result<Client> {
@@ -300,7 +300,13 @@ async fn get_forward_signature(
 
 fn get_author_signature(config: &Config, message: &types::Message) -> Option<String> {
     let post_author = message.post_author.as_ref()?;
-    Some(config.forward.posted_by.replace("{}", post_author))
+    Some(
+        config
+            .forward
+            .posted_by
+            .as_ref()?
+            .replace("{}", post_author),
+    )
 }
 
 async fn forward_post(
