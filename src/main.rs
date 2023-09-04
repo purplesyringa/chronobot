@@ -31,6 +31,7 @@ use text_io::read;
 struct Config {
     login: ConfigLogin,
     access: ConfigAccess,
+    #[serde(default)]
     forward: ConfigForward,
 }
 
@@ -48,7 +49,7 @@ struct ConfigAccess {
     private_discussion_joinlink_hash: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct ConfigForward {
     public_discussion: Option<String>,
     private_discussion: Option<String>,
