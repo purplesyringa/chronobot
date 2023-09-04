@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use grammers_client::{
     types::{Channel, Chat, Group, InputMessage, Message, PackedChat},
-    Client, Config, Update,
+    Client, Update,
 };
 use grammers_session::Session;
 use grammers_tl_types::{
@@ -21,25 +21,58 @@ use grammers_tl_types::{
         PeerChannel, Photo,
     },
 };
+use serde::Deserialize;
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use text_io::read;
 
-mod config;
-use config::*;
+#[derive(Deserialize)]
+struct Config {
+    login: ConfigLogin,
+    access: ConfigAccess,
+    forward: ConfigForward,
+}
 
-async fn create_client() -> Result<Client> {
-    let client = Client::connect(Config {
+#[derive(Deserialize)]
+struct ConfigLogin {
+    api_id: i32,
+    api_hash: String,
+    phone: String,
+}
+
+#[derive(Deserialize)]
+struct ConfigAccess {
+    channel_username: String,
+    public_discussion_joinlink_hash: String,
+    private_discussion_joinlink_hash: String,
+}
+
+#[derive(Deserialize)]
+struct ConfigForward {
+    public_discussion: Option<String>,
+    private_discussion: Option<String>,
+    forwarded_from: Option<String>,
+    posted_by: String,
+}
+
+async fn create_client(config: &Config) -> Result<Client> {
+    let client = Client::connect(grammers_client::Config {
         session: Session::load_file_or_create("aldan.session")?,
-        api_id: API_ID,
-        api_hash: API_HASH.to_string(),
+        api_id: config.login.api_id,
+        api_hash: config.login.api_hash.clone(),
         params: Default::default(),
     })
     .await?;
 
     if !client.is_authorized().await? {
-        let token = client.request_login_code(PHONE, API_ID, API_HASH).await?;
+        let token = client
+            .request_login_code(
+                &config.login.phone,
+                config.login.api_id,
+                &config.login.api_hash,
+            )
+            .await?;
         print!("Enter the login code: ");
         let code: String = read!("{}\n");
         client.sign_in(&token, &code).await?;
@@ -181,15 +214,15 @@ fn get_url_from_forward_header(header: &types::MessageFwdHeader) -> Option<Strin
 }
 
 async fn get_forward_signature(
+    config: &Config,
     client: &Client,
     message: &types::Message,
     offset: i32,
     channel: &Channel,
 ) -> Result<Option<(String, Option<MessageEntity>)>> {
-    if FORWARDED_FROM_TEXT.is_empty() {
+    let Some(ref pattern) = config.forward.forwarded_from else {
         return Ok(None);
-    }
-    let (prefix, suffix) = FORWARDED_FROM_TEXT.split_once("{}").unwrap();
+    };
 
     let Some(MessageFwdHeader::Header(header)) = message.fwd_from.as_ref() else {
         return Ok(None);
@@ -245,26 +278,28 @@ async fn get_forward_signature(
         return Ok(None);
     }
 
-    let text = format!("{prefix}{name}{suffix}");
-    let entity = get_url_from_forward_header(header).map(|url| {
-        MessageEntity::TextUrl(MessageEntityTextUrl {
-            offset: offset + tl_len(prefix),
-            length: tl_len(&name),
-            url,
-        })
-    });
-    Ok(Some((text, entity)))
+    if let Some((prefix, suffix)) = pattern.split_once("{}") {
+        let text = format!("{prefix}{name}{suffix}");
+        let entity = get_url_from_forward_header(header).map(|url| {
+            MessageEntity::TextUrl(MessageEntityTextUrl {
+                offset: offset + tl_len(prefix),
+                length: tl_len(&name),
+                url,
+            })
+        });
+        Ok(Some((text, entity)))
+    } else {
+        Ok(Some((pattern.to_string(), None)))
+    }
 }
 
-fn get_author_signature(message: &types::Message) -> Option<String> {
-    if POSTED_BY_TEXT.is_empty() {
-        return None;
-    }
-    let (prefix, suffix) = POSTED_BY_TEXT.split_once("{}").unwrap();
-    Some(format!("{prefix}{}{suffix}", message.post_author.as_ref()?))
+fn get_author_signature(config: &Config, message: &types::Message) -> Option<String> {
+    let post_author = message.post_author.as_ref()?;
+    Some(config.forward.posted_by.replace("{}", post_author))
 }
 
 async fn forward_post(
+    config: &Config,
     client: &Client,
     public_discussion_messages: &[Message],
     public_discussion: &Group,
@@ -285,25 +320,46 @@ async fn forward_post(
         header.saved_from_msg_id.unwrap(),
     )
     .await?;
-
-    let mut message_prefix = message.message.trim().to_string();
-    if !message_prefix.is_empty() {
-        message_prefix += "\n\n";
-    }
-    let mut new_text = format!("{message_prefix}{POST_SIGNATURE}");
     let mut new_entities = message.entities.clone().unwrap_or_else(Vec::new);
-    new_entities.push(MessageEntity::TextUrl(MessageEntityTextUrl {
-        offset: tl_len(&message_prefix),
-        length: tl_len(POST_SIGNATURE),
-        url: format!("https://t.me/{CHANNEL_USERNAME}/{}", message.id),
-    }));
+
+    let additional_text;
+    let link_offset;
+    let link_length;
+    let pattern = config.forward.private_discussion.as_deref().unwrap_or("");
+    if let Some((prefix, rest)) = pattern.split_once("[[") {
+        let (mid, suffix) = rest
+            .split_once("]]")
+            .expect("Invalid forward.private_discussion");
+        additional_text = format!("{prefix}{mid}{suffix}");
+        link_offset = tl_len(prefix);
+        link_length = tl_len(mid);
+    } else {
+        additional_text = pattern.to_string();
+        link_offset = -1;
+        link_length = -1;
+    }
+
+    let old_text = message.message.trim();
+    let new_text_untrimmed = format!("{old_text}{additional_text}");
+    let mut new_text = new_text_untrimmed.trim_start().to_string();
+    let whitespace_trimmed = &new_text_untrimmed[..new_text_untrimmed.len() - new_text.len()];
+    if link_offset != -1 {
+        new_entities.push(MessageEntity::TextUrl(MessageEntityTextUrl {
+            offset: tl_len(old_text) + link_offset - tl_len(whitespace_trimmed),
+            length: link_length,
+            url: format!(
+                "https://t.me/{}/{}",
+                config.access.channel_username, message.id
+            ),
+        }));
+    }
 
     if let Some((text, entity)) =
-        get_forward_signature(client, &message, tl_len(&new_text), channel).await?
+        get_forward_signature(config, client, &message, tl_len(&new_text), channel).await?
     {
         new_text += &text;
         new_entities.extend(entity);
-    } else if let Some(text) = get_author_signature(&message) {
+    } else if let Some(text) = get_author_signature(config, &message) {
         new_text += &text;
     }
 
@@ -392,7 +448,13 @@ async fn forward_post(
         }
     }
 
+    let mut new_entities = if new_entities.is_empty() {
+        None
+    } else {
+        Some(new_entities)
+    };
     let first_random_id = rand::random();
+
     let updates;
     if input_media.is_empty() {
         updates = client
@@ -409,7 +471,7 @@ async fn forward_post(
                 message: new_text,
                 random_id: first_random_id,
                 reply_markup: None,
-                entities: Some(new_entities),
+                entities: new_entities,
                 schedule_date: None,
                 send_as: None,
             })
@@ -429,7 +491,7 @@ async fn forward_post(
                 message: new_text,
                 random_id: first_random_id,
                 reply_markup: None,
-                entities: Some(new_entities),
+                entities: new_entities,
                 schedule_date: None,
                 send_as: None,
             })
@@ -437,7 +499,6 @@ async fn forward_post(
     } else {
         let mut random_id = Some(first_random_id);
         let mut new_text = Some(new_text);
-        let mut new_entities = Some(new_entities);
         updates = client
             .invoke(&SendMultiMedia {
                 silent: message.silent,
@@ -483,22 +544,36 @@ async fn forward_post(
     Ok(format!("https://t.me/c/{}/{}", private_discussion.id(), id))
 }
 
-async fn add_discussion_link(message: &Message, private_link: String) -> Result<()> {
-    message
-        .reply(
-            InputMessage::text(format!("{PRIVATE_LINK_TEXT}{PRIVATE_INFO_TEXT}")).fmt_entities(
-                vec![MessageEntity::TextUrl(MessageEntityTextUrl {
-                    offset: 0,
-                    length: tl_len(PRIVATE_LINK_TEXT),
-                    url: private_link,
-                })],
-            ),
-        )
-        .await?;
+async fn add_discussion_link(
+    config: &Config,
+    message: &Message,
+    private_link: String,
+) -> Result<()> {
+    let Some(ref pattern) = config.forward.public_discussion else {
+        return Ok(());
+    };
+
+    let reply = if let Some((prefix, rest)) = pattern.split_once("[[") {
+        let Some((mid, suffix)) = rest.split_once("]]") else {
+            bail!("Invalid forward.public_discussion");
+        };
+        InputMessage::text(format!("{prefix}{mid}{suffix}")).fmt_entities(vec![
+            MessageEntity::TextUrl(MessageEntityTextUrl {
+                offset: tl_len(prefix),
+                length: tl_len(mid),
+                url: private_link,
+            }),
+        ])
+    } else {
+        InputMessage::text(pattern.clone())
+    };
+
+    message.reply(reply).await?;
     Ok(())
 }
 
 async fn handle_post(
+    config: &Config,
     client: &Client,
     messages: &[Message],
     public_discussion: &Group,
@@ -506,6 +581,7 @@ async fn handle_post(
     channel: &Channel,
 ) -> Result<()> {
     let private_link = forward_post(
+        config,
         client,
         messages,
         public_discussion,
@@ -513,17 +589,20 @@ async fn handle_post(
         channel,
     )
     .await?;
-    add_discussion_link(&messages[0], private_link).await?;
+    add_discussion_link(config, &messages[0], private_link).await?;
     Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let client = Arc::new(create_client().await?);
+    let config = std::fs::read_to_string("config.toml").context("Failed to read config.toml")?;
+    let config = Arc::new(toml::from_str(&config).context("Failed to parse config")?);
+
+    let client = Arc::new(create_client(&config).await?);
 
     let public_discussion = match client
         .invoke(&CheckChatInvite {
-            hash: PUBLIC_DISCUSSION_JOINLINK_HASH.to_string(),
+            hash: config.access.public_discussion_joinlink_hash.clone(),
         })
         .await?
     {
@@ -533,7 +612,7 @@ async fn main() -> Result<()> {
 
     let private_discussion = match client
         .invoke(&CheckChatInvite {
-            hash: PRIVATE_DISCUSSION_JOINLINK_HASH.to_string(),
+            hash: config.access.private_discussion_joinlink_hash.clone(),
         })
         .await?
     {
@@ -541,7 +620,10 @@ async fn main() -> Result<()> {
         _ => panic!("Invalid private discussion join link"),
     };
 
-    let channel = match client.resolve_username(CHANNEL_USERNAME).await? {
+    let channel = match client
+        .resolve_username(&config.access.channel_username)
+        .await?
+    {
         Some(Chat::Channel(channel)) => Arc::new(channel),
         _ => panic!("Invalid channel username"),
     };
@@ -565,6 +647,7 @@ async fn main() -> Result<()> {
                 entry.or_insert_with(Vec::new).push(message);
             }
             if was_vacant {
+                let config = Arc::clone(&config);
                 let client = Arc::clone(&client);
                 let public_discussion = Arc::clone(&public_discussion);
                 let private_discussion = Arc::clone(&private_discussion);
@@ -580,6 +663,7 @@ async fn main() -> Result<()> {
                             .expect("grouped_id is missing from the hashmap");
                     }
                     handle_post(
+                        &config,
                         &client,
                         &messages,
                         &public_discussion,
@@ -592,6 +676,7 @@ async fn main() -> Result<()> {
             }
         } else {
             handle_post(
+                &config,
                 &client,
                 &[message],
                 &public_discussion,
