@@ -6,19 +6,18 @@ use grammers_client::{
 use grammers_session::Session;
 use grammers_tl_types::{
     enums::{
-        self, messages::Messages, ChatInvite, InputChannel, InputMedia, InputUser, MessageEntity,
-        MessageFwdHeader, MessageMedia, MessageReplies, MessageReplyHeader, Peer, Updates, User,
+        self, messages::Messages, ChatInvite, InputChannel, InputMedia, MessageEntity,
+        MessageFwdHeader, MessageMedia, MessageReplies, MessageReplyHeader, Peer, Updates,
+        Username,
     },
     functions::{
-        channels::{GetChannels, GetMessages},
+        channels::GetMessages,
         messages::{CheckChatInvite, SendMedia, SendMessage, SendMultiMedia},
-        users::GetUsers,
     },
     types::{
         self, Document, InputChannelFromMessage, InputDocument, InputMediaDocument,
-        InputMediaPhoto, InputMessageId, InputPhoto, InputSingleMedia, InputUserFromMessage,
-        MessageEntityTextUrl, MessageEntityUrl, MessageMediaDocument, MessageMediaPhoto,
-        PeerChannel, Photo,
+        InputMediaPhoto, InputMessageId, InputPhoto, InputSingleMedia, MessageEntityTextUrl,
+        MessageEntityUrl, MessageMediaDocument, MessageMediaPhoto, PeerChannel, Photo, User,
     },
 };
 use serde::Deserialize;
@@ -113,7 +112,11 @@ async fn get_message(
     orig_msg_id: i32,
     channel_id: i64,
     id: i32,
-) -> Result<types::Message> {
+) -> Result<(
+    types::Message,
+    HashMap<i64, types::Channel>,
+    HashMap<i64, User>,
+)> {
     let message = client
         .invoke(&GetMessages {
             channel: InputChannel::FromMessage(InputChannelFromMessage {
@@ -124,14 +127,29 @@ async fn get_message(
             id: vec![enums::InputMessage::Id(InputMessageId { id })],
         })
         .await?;
-    let message = match message {
-        Messages::ChannelMessages(mut messages) => messages.messages.pop(),
-        _ => bail!("Unexpected result from GetMessages"),
+    let Messages::ChannelMessages(mut message) = message else {
+        bail!("Expected ChannelMessages from GetMessages")
     };
+
+    let mut channels = HashMap::new();
+    for chat in message.chats {
+        if let enums::Chat::Channel(channel) = chat {
+            channels.insert(channel.id, channel);
+        }
+    }
+
+    let mut users = HashMap::new();
+    for user in message.users {
+        if let enums::User::User(user) = user {
+            users.insert(user.id, user);
+        }
+    }
+
+    let message = message.messages.pop();
     let Some(enums::Message::Message(message)) = message else {
         bail!("Unexpected result from GetMessages");
     };
-    Ok(message)
+    Ok((message, channels, users))
 }
 
 async fn get_reply_post(
@@ -151,7 +169,8 @@ async fn get_reply_post(
             channel.id(),
             header.reply_to_msg_id,
         )
-        .await?,
+        .await?
+        .0,
     ))
 }
 
@@ -201,9 +220,31 @@ async fn get_private_forwarded_post_id(
     Ok(msg_id_str.parse::<i32>().ok())
 }
 
-fn get_url_from_forward_header(header: &types::MessageFwdHeader) -> Option<String> {
+fn get_user_username(user: &User) -> Option<&str> {
+    if let Some(ref username) = user.username {
+        return Some(username);
+    }
+    user.usernames.as_ref().and_then(|usernames| {
+        usernames.iter().find_map(|username| {
+            let Username::Username(username) = username;
+            username.active.then_some(username.username.as_str())
+        })
+    })
+}
+
+fn get_url_from_forward_header(
+    header: &types::MessageFwdHeader,
+    users: &HashMap<i64, User>,
+) -> Option<String> {
     match header.from_id.as_ref()? {
-        Peer::User(user) => Some(format!("tg://user?id={}", user.user_id)),
+        Peer::User(user) => {
+            let user = users.get(&user.user_id)?;
+            if let Some(username) = get_user_username(user) {
+                Some(format!("https://t.me/{username}"))
+            } else {
+                Some(format!("tg://user?id={}", user.id))
+            }
+        }
         Peer::Channel(channel) => {
             let channel_link = format!("https://t.me/c/{}", channel.channel_id);
             Some(match header.channel_post {
@@ -217,10 +258,10 @@ fn get_url_from_forward_header(header: &types::MessageFwdHeader) -> Option<Strin
 
 async fn get_forward_signature(
     config: &Config,
-    client: &Client,
     message: &types::Message,
+    channels: &HashMap<i64, types::Channel>,
+    users: &HashMap<i64, User>,
     offset: i32,
-    channel: &Channel,
 ) -> Result<Option<(String, Option<MessageEntity>)>> {
     let Some(MessageFwdHeader::Header(header)) = message.fwd_from.as_ref() else {
         return Ok(None);
@@ -234,45 +275,21 @@ async fn get_forward_signature(
     } else if let Some(ref from) = header.from_id {
         match from {
             Peer::User(user) => {
-                let user = client
-                    .invoke(&GetUsers {
-                        id: vec![InputUser::FromMessage(InputUserFromMessage {
-                            peer: channel.pack().to_input_peer(),
-                            msg_id: message.id,
-                            user_id: user.user_id,
-                        })],
-                    })
-                    .await?
-                    .pop()
-                    .unwrap();
-                name = match user {
-                    User::Empty(_) => bail!("Empty user"),
-                    User::User(user) => match (user.first_name, user.last_name) {
-                        (Some(x), Some(y)) => format!("{x} {y}"),
-                        (Some(x), None) | (None, Some(x)) => x,
-                        (None, None) => bail!("User without name"),
-                    },
+                let user = users.get(&user.user_id).context("Unknown user")?;
+                name = match (&user.first_name, &user.last_name) {
+                    (Some(x), Some(y)) => format!("{x} {y}"),
+                    (Some(x), None) | (None, Some(x)) => x.to_string(),
+                    (None, None) => bail!("User without name"),
                 };
                 pattern = &config.forward.forwarded_from_user;
             }
             Peer::Chat(_) => bail!("Forward from chat"),
             Peer::Channel(from_channel) => {
-                let from_channel = client
-                    .invoke(&GetChannels {
-                        id: vec![InputChannel::FromMessage(InputChannelFromMessage {
-                            peer: channel.pack().to_input_peer(),
-                            msg_id: message.id,
-                            channel_id: from_channel.channel_id,
-                        })],
-                    })
-                    .await?
-                    .chats()
-                    .pop()
-                    .unwrap();
-                name = match from_channel {
-                    enums::Chat::Channel(from_channel) => from_channel.title,
-                    _ => bail!("Unexpected return from GetChannels"),
-                };
+                name = channels
+                    .get(&from_channel.channel_id)
+                    .context("Unknown channel")?
+                    .title
+                    .clone();
                 pattern = &config.forward.forwarded_from_channel;
             }
         }
@@ -286,7 +303,7 @@ async fn get_forward_signature(
 
     if let Some((prefix, suffix)) = pattern.split_once("{}") {
         let text = format!("{prefix}{name}{suffix}");
-        let entity = get_url_from_forward_header(header).map(|url| {
+        let entity = get_url_from_forward_header(header, users).map(|url| {
             MessageEntity::TextUrl(MessageEntityTextUrl {
                 offset: offset + tl_len(prefix),
                 length: tl_len(&name),
@@ -324,7 +341,7 @@ async fn forward_post(
         bail!("Unexpected message in public discussion");
     };
 
-    let message = get_message(
+    let (message, channels, users) = get_message(
         client,
         public_discussion.pack(),
         public_discussion_messages[0].id(),
@@ -367,7 +384,7 @@ async fn forward_post(
     }
 
     if let Some((text, entity)) =
-        get_forward_signature(config, client, &message, tl_len(&new_text), channel).await?
+        get_forward_signature(config, &message, &channels, &users, tl_len(&new_text)).await?
     {
         new_text += &text;
         new_entities.extend(entity);
@@ -410,7 +427,8 @@ async fn forward_post(
             channel_id,
             header.saved_from_msg_id.unwrap(),
         )
-        .await?;
+        .await?
+        .0;
         match message.media {
             Some(MessageMedia::Photo(MessageMediaPhoto {
                 photo: Some(photo),
