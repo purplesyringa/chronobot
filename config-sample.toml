@@ -11,5 +11,6 @@ private_discussion_joinlink_hash = "QWERTYUIOPASDFGH"
 [forward]
 public_discussion = "[[Обсуждение]]\nПрисоединиться: @theyukichat"
 private_discussion = "\n\n[[→ @mt19937_64]]"
-forwarded_from = " (переслано из {})"
+forwarded_from_channel = " (переслано из {})"
+forwarded_from_user = " (переслано от {})"
 posted_by = " (опубликовано {})"

@@ -52,7 +52,8 @@ struct ConfigAccess {
 struct ConfigForward {
     public_discussion: Option<String>,
     private_discussion: Option<String>,
-    forwarded_from: Option<String>,
+    forwarded_from_channel: Option<String>,
+    forwarded_from_user: Option<String>,
     posted_by: String,
 }
 
@@ -220,17 +221,15 @@ async fn get_forward_signature(
     offset: i32,
     channel: &Channel,
 ) -> Result<Option<(String, Option<MessageEntity>)>> {
-    let Some(ref pattern) = config.forward.forwarded_from else {
-        return Ok(None);
-    };
-
     let Some(MessageFwdHeader::Header(header)) = message.fwd_from.as_ref() else {
         return Ok(None);
     };
 
     let name;
+    let pattern;
     if let Some(ref from_name) = header.from_name {
         name = from_name.clone();
+        pattern = &config.forward.forwarded_from_user;
     } else if let Some(ref from) = header.from_id {
         match from {
             Peer::User(user) => {
@@ -253,6 +252,7 @@ async fn get_forward_signature(
                         (None, None) => bail!("User without name"),
                     },
                 };
+                pattern = &config.forward.forwarded_from_user;
             }
             Peer::Chat(_) => bail!("Forward from chat"),
             Peer::Channel(from_channel) => {
@@ -272,11 +272,16 @@ async fn get_forward_signature(
                     enums::Chat::Channel(from_channel) => from_channel.title,
                     _ => bail!("Unexpected return from GetChannels"),
                 };
+                pattern = &config.forward.forwarded_from_channel;
             }
         }
     } else {
         return Ok(None);
     }
+
+    let Some(ref pattern) = pattern else {
+        return Ok(None);
+    };
 
     if let Some((prefix, suffix)) = pattern.split_once("{}") {
         let text = format!("{prefix}{name}{suffix}");
