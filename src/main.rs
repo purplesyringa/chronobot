@@ -183,7 +183,7 @@ async fn get_private_forwarded_post_id(
     let Some(entities) = last_public_reply.fmt_entities() else {
         return Ok(None);
     };
-    if entities.len() != 1 {
+    if entities.is_empty() {
         return Ok(None);
     }
 
