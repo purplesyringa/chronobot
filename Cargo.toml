@@ -1,0 +1,13 @@
+[package]
+name = "chronobot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.75"
+grammers-client = { git = "https://github.com/Lonami/grammers.git", version = "0.4.0", rev = "543e857", features = ["unstable_raw"] }
+grammers-session = { git = "https://github.com/Lonami/grammers.git", version = "0.4.1", rev = "543e857" }
+grammers-tl-types = { git = "https://github.com/Lonami/grammers.git", version = "0.4.0", rev = "543e857" }
+rand = "0.8.5"
+text_io = "0.1.12"
+tokio = { version = "1.32.0", features = ["rt", "macros", "time"] }
