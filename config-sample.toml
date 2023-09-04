@@ -1,0 +1,15 @@
+[login]
+api_id = 123456
+api_hash = "0123456789abcdef0123456789abcdef"
+phone = "+33639981234"
+
+[access]
+channel_username = "mt19937_64"
+public_discussion_joinlink_hash = "qwertyuiopasdfgh"
+private_discussion_joinlink_hash = "QWERTYUIOPASDFGH"
+
+[forward]
+public_discussion = "[[Обсуждение]]\nПрисоединиться: @theyukichat"
+private_discussion = "\n\n[[→ @mt19937_64]]"
+forwarded_from = " (переслано из {})"
+posted_by = " (опубликовано {})"
