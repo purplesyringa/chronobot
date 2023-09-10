@@ -43,7 +43,7 @@ struct ConfigLogin {
 
 #[derive(Deserialize)]
 struct ConfigAccess {
-    channel_username: String,
+    channel_joinlink_hash: String,
     public_discussion_joinlink_hash: String,
     private_discussion_joinlink_hash: String,
 }
@@ -376,10 +376,7 @@ async fn forward_post(
         new_entities.push(MessageEntity::TextUrl(MessageEntityTextUrl {
             offset: tl_len(old_text) + link_offset - tl_len(whitespace_trimmed),
             length: link_length,
-            url: format!(
-                "https://t.me/{}/{}",
-                config.access.channel_username, message.id
-            ),
+            url: format!("https://t.me/c/{channel_id}/{}", message.id),
         }));
     }
 
@@ -651,11 +648,13 @@ async fn main() -> Result<()> {
     };
 
     let channel = match client
-        .resolve_username(&config.access.channel_username)
+        .invoke(&CheckChatInvite {
+            hash: config.access.channel_joinlink_hash.clone(),
+        })
         .await?
     {
-        Some(Chat::Channel(channel)) => Arc::new(channel),
-        _ => panic!("Invalid channel username"),
+        ChatInvite::Already(already) => Arc::new(Channel::from_raw(already.chat)),
+        _ => panic!("Invalid channel join link"),
     };
 
     let messages_by_grouped_id = Arc::new(Mutex::new(HashMap::new()));

@@ -4,7 +4,7 @@ api_hash = "0123456789abcdef0123456789abcdef"
 phone = "+33639981234"
 
 [access]
-channel_username = "mt19937_64"
+channel_joinlink_hash = "abcdefghijklmnop"
 public_discussion_joinlink_hash = "qwertyuiopasdfgh"
 private_discussion_joinlink_hash = "QWERTYUIOPASDFGH"
 
